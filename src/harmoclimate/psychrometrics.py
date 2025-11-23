@@ -27,6 +27,14 @@ MIN_DENOM = 1e-12
 MAX_Q_KG_PER_KG = 0.05
 
 
+def _ensure_array(
+    data: pd.Series | np.ndarray | float | list,
+    dtype: type = np.float64,
+) -> np.ndarray:
+    """Ensure input is a numpy array of the specified type."""
+    return np.asarray(data, dtype=dtype)
+
+
 def buck_enhancement_factor_water_eq6(
     temp_c: pd.Series | np.ndarray,
     pressure_hpa: pd.Series | np.ndarray,
@@ -70,8 +78,8 @@ def _specific_humidity_from_vapor_pressure(
 ) -> np.ndarray:
     """Return specific humidity (kg/kg) from vapor partial pressure and pressure (hPa)."""
 
-    e = np.asarray(vapor_pressure_hpa, dtype=np.float64)
-    p = np.asarray(pressure_hpa, dtype=np.float64)
+    e = _ensure_array(vapor_pressure_hpa)
+    p = _ensure_array(pressure_hpa)
     denom = np.maximum(p - ONE_MINUS_EPS * e, MIN_DENOM)
     q = EPS * e / denom
     return np.clip(q, 0.0, MAX_Q_KG_PER_KG)
@@ -88,9 +96,9 @@ def specific_humidity_kg_per_kg(
     `buck_enhancement_factor_water_eq6`.
     """
 
-    T = np.asarray(temp_c, dtype=np.float64)
-    RH = np.clip(np.asarray(rh_percent, dtype=np.float64), 0.0, 100.0)
-    P = np.asarray(pressure_hpa, dtype=np.float64)
+    T = _ensure_array(temp_c)
+    RH = np.clip(_ensure_array(rh_percent), 0.0, 100.0)
+    P = _ensure_array(pressure_hpa)
     E, _, _ = _moist_air_vapor_pressure_hpa(T, P, RH)
     return _specific_humidity_from_vapor_pressure(E, P)
 
@@ -106,9 +114,9 @@ def relative_humidity_percent_from_specific(
     `buck_enhancement_factor_water_eq6` for the enhancement factor `f`.
     """
 
-    q = np.asarray(q_kg_per_kg, dtype=np.float64)
-    p = np.asarray(pressure_hpa, dtype=np.float64)
-    T = np.asarray(temp_c, dtype=np.float64)
+    q = _ensure_array(q_kg_per_kg)
+    p = _ensure_array(pressure_hpa)
+    T = _ensure_array(temp_c)
     e_hpa = vapor_partial_pressure_hpa_from_q_p(q, p)
     Es = esat_water_hpa(T)
     f = buck_enhancement_factor_water_eq6(T, p)
@@ -121,7 +129,7 @@ def dew_point_c_from_e(
 ) -> np.ndarray:
     """Return dew point over liquid water (°C) from vapor partial pressure (hPa)."""
 
-    e = np.asarray(e_hpa, dtype=np.float64)
+    e = _ensure_array(e_hpa)
     e = np.clip(e, MIN_E_HPA, None)  # Numerical safety bound.
     return T_from_e_water(e)
 
@@ -132,8 +140,8 @@ def vapor_partial_pressure_hpa_from_q_p(
 ) -> np.ndarray:
     """Return vapor partial pressure (hPa) from specific humidity (kg/kg) and pressure (hPa)."""
 
-    q = np.asarray(q_kg_per_kg, dtype=np.float64)
-    p = np.asarray(pressure_hpa, dtype=np.float64)
+    q = _ensure_array(q_kg_per_kg)
+    p = _ensure_array(pressure_hpa)
     q = np.clip(q, 0.0, MAX_Q_KG_PER_KG)
     denom = np.maximum(EPS + ONE_MINUS_EPS * q, MIN_DENOM)  # Numerical safety bound.
     e_hpa = (q * p) / denom
@@ -152,9 +160,9 @@ def thermo_from_T_P_RH(
     `buck_enhancement_factor_water_eq6` for the enhancement factor.
     """
 
-    T = np.asarray(temp_c, dtype=np.float64)
-    P = np.asarray(pressure_hpa, dtype=np.float64)
-    RH = np.clip(np.asarray(rh_percent, dtype=np.float64), 0.0, 100.0)
+    T = _ensure_array(temp_c)
+    P = _ensure_array(pressure_hpa)
+    RH = np.clip(_ensure_array(rh_percent), 0.0, 100.0)
 
     E, Es, _ = _moist_air_vapor_pressure_hpa(T, P, RH)
     q = _specific_humidity_from_vapor_pressure(E, P)

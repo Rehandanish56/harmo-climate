@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Iterable, Mapping, Sequence, Optional
+
+import numpy as np
 
 
 def _format_array(values: Sequence[float], indent: str = "    ", per_line: int = 6) -> str:
@@ -76,11 +78,96 @@ def _generate_model_namespace(namespace: str, payload: Mapping[str, object]) -> 
     return lines
 
 
+def _generate_stochastic_namespace(payload: Mapping[str, object]) -> list[str]:
+    metadata = payload.get("metadata", {})
+    variables = metadata.get("variables")
+    expected_variables = ["P", "Q", "T"]
+
+    if variables != expected_variables:
+        raise ValueError(
+            f"Stochastic model variables {variables} do not match expected order {expected_variables}. "
+            "C++ template requires fixed order [P, Q, T]."
+        )
+
+    model = payload["model"]
+    # Matrix A is 3x3, where x_t = x_{t-1} * A + noise
+    # Variables are [P, Q, T]
+    A = np.array(model["coefficient_matrix"], dtype=float)
+    Sigma = np.array(model["covariance_matrix"], dtype=float)
+
+    # Compute Cholesky decomposition: Sigma = L @ L.T
+    # L is lower triangular.
+    try:
+        L = np.linalg.cholesky(Sigma)
+    except np.linalg.LinAlgError:
+        # Fallback for singular matrix or numerical issues: use Identity or zero
+        # This implies no noise if singular? Or maybe just diagonal sqrt?
+        # For now, assume valid. If not, we could raise or warn.
+        # Let's raise to make it visible.
+        raise ValueError("Stochastic covariance matrix is not positive definite.")
+
+    lines = []
+    lines.append("namespace stochastic {")
+
+    lines.append("// VAR(1) model for residuals: [P, Q, T]")
+    lines.append("// x_t = x_{t-1} * A + noise")
+    lines.append("// noise = u * L^T, where u ~ N(0, I)")
+
+    lines.append("static constexpr double A[9] = {")
+    lines.append(_format_array(A.flatten(), indent="    ", per_line=3))
+    lines.append("};")
+
+    lines.append("static constexpr double L[9] = {")
+    lines.append(_format_array(L.flatten(), indent="    ", per_line=3))
+    lines.append("};")
+
+    lines.append("""
+struct State {
+    double p_res = 0.0;
+    double q_res = 0.0;
+    double t_res = 0.0;
+};
+
+// Updates state using VAR(1) process.
+// u_p, u_q, u_t: Independent standard normal random numbers provided by the caller.
+inline void update_state(State& s, double u_p, double u_q, double u_t) {
+    // Map state and input to arrays
+    double x[3] = {s.p_res, s.q_res, s.t_res};
+    double u[3] = {u_p, u_q, u_t};
+
+    // Compute noise n = u * L^T
+    // n[j] = sum_k u[k] * L[j][k] (since L^T at [k][j] is L[j][k])
+    double n[3] = {0.0, 0.0, 0.0};
+    for(int j=0; j<3; ++j) {
+        for(int k=0; k<3; ++k) {
+             n[j] += u[k] * L[j*3 + k];
+        }
+    }
+
+    // Compute transition v = x * A
+    // v[j] = sum_k x[k] * A[k][j] (assuming row vector x)
+    double v[3] = {0.0, 0.0, 0.0};
+    for(int j=0; j<3; ++j) {
+        for(int k=0; k<3; ++k) {
+             v[j] += x[k] * A[k*3 + j];
+        }
+    }
+
+    s.p_res = v[0] + n[0];
+    s.q_res = v[1] + n[1];
+    s.t_res = v[2] + n[2];
+}
+""")
+    lines.append("} // namespace stochastic")
+    return lines
+
+
 def generate_cpp_header(
     temperature_payload: Mapping[str, object],
     specific_humidity_payload: Mapping[str, object],
     pressure_payload: Mapping[str, object],
     output_path: Path,
+    stochastic_payload: Optional[Mapping[str, object]] = None,
 ) -> None:
     """Render the linear harmonic models as a standalone C++ header."""
 
@@ -139,6 +226,15 @@ def generate_cpp_header(
     lines.extend(_generate_model_namespace("specific_humidity_model", specific_humidity_payload))
     lines.extend(_generate_model_namespace("pressure_model", pressure_payload))
 
+    stochastic_success = False
+    if stochastic_payload:
+        try:
+            lines.extend(_generate_stochastic_namespace(stochastic_payload))
+            stochastic_success = True
+        except Exception as e:
+            print(f"[Warn] Failed to generate stochastic namespace: {e}")
+            lines.append(f"// [Warn] Stochastic model generation failed: {e}")
+
     lines.append("inline double predict_temperature(double day_utc, double hour_utc){")
     lines.append("    double hour_solar = detail::wrap_hour(hour_utc + delta_utc_solar_h);")
     lines.append("    double day_solar  = detail::wrap_day(day_utc + (delta_utc_solar_h / 24.0));")
@@ -167,6 +263,17 @@ def generate_cpp_header(
     lines.append("    specific_humidity_kg_kg = specific_humidity_model::evaluate(day_solar, hour_solar);")
     lines.append("    pressure_hpa = pressure_model::evaluate(day_solar, hour_solar);")
     lines.append("}")
+
+    if stochastic_success:
+        lines.append(
+            "inline void predict_stochastic(double day_utc, double hour_utc, const stochastic::State& state, "
+            "double& temperature_c, double& specific_humidity_kg_kg, double& pressure_hpa){"
+        )
+        lines.append("    predict(day_utc, hour_utc, temperature_c, specific_humidity_kg_kg, pressure_hpa);")
+        lines.append("    temperature_c += state.t_res;")
+        lines.append("    specific_humidity_kg_kg += state.q_res;")
+        lines.append("    pressure_hpa += state.p_res;")
+        lines.append("}")
 
     lines.append("} // namespace harmoclimat")
 

@@ -53,9 +53,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     display_parser.add_argument(
         "--mode",
-        choices=("annual", "intraday"),
+        choices=("annual", "intraday", "stochastic_annual", "stochastic_intraday"),
         default="annual",
-        help="Choose 'annual' for yearly envelopes or 'intraday' for a single solar day profile.",
+        help="Choose 'annual' or 'stochastic_annual' for yearly plots, 'intraday' or 'stochastic_intraday' for daily.",
     )
     display_parser.add_argument(
         "--day",

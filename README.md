@@ -5,6 +5,7 @@
 **Embed anywhere with zero extra dependencies.** Code templates are provided (e.g., C++) to integrate a generated model as a single, self-contained file.
 
 The model uses a small, explainable set of harmonics, so each component can be inspected and, if needed, manually adjusted. An historical error envelope (quantile band derived from observations) lets you compare the baseline to real world data.
+A lightweight residual sparse VAR stochastic component can also be trained to inject realistic, cross-variable variability around the deterministic baseline and synthesize hourly traces.
 
 Robustness is assessed with Leave-One-Year-Out (LOYO) validation, holding out each year in turn and comparing RMSE for both the model and the historical mean climatology. The current bundle shows a typical positive LOYO skill of roughly +3% versus the historical mean baseline across the archived years.
 
@@ -29,12 +30,17 @@ The repository ships with several reference French weather stations that demonst
 
 ![Bourges intraday profile](generated/media/fr_bourges_intraday_100.png)
 
+### Stochastic annual simulation
+
+![Bourges stochastic annual simulation](generated/media/fr_bourges_stochastic_annual.png)
+
 ## Generator Features
 
 - Streams historical hourly observations for a French department directly from public Météo-France archives.
 - Filters the source data down to a single station (configurable), normalises timestamps to UTC, and persists raw climatic fields; solar/orbital conversions are handled downstream by `harmoclimate.core`.
 - Fits configurable linear harmonic models for temperature (°C), specific humidity (kg/kg), and pressure (hPa) via least-squares regression, caching per-year sufficient statistics for fast leave-one-year-out (LOYO) sweeps.
 - Evaluates fitted models with a LOYO protocol against a no-leap UTC day/hour climatology (computed from all other years), capturing MAE envelopes plus per-year RMSE/skill metrics. Global LOYO RMSE/skill summaries are stored on each model JSON (`training_loyo_rmse`, `training_loyo_skill`), while detailed per-year reports live under `generated/models/training_metrics/`.
+- Trains an optional residual sparse VAR stochastic model across temperature, specific humidity, and pressure residuals; the export (`{basename}_stochastic.json`) captures the cross-variable autoregressive matrix, noise covariance, and annual harmonic envelopes for skew-normal parameters (shape and scale) for Monte Carlo-style simulations.
 - Exports one JSON parameter bundle per target and generates a self-contained C++ header for embedded use.
 - Provides optional visualisation helpers for comparing the generated model to historical climatology.
 
@@ -117,6 +123,7 @@ The CLI exposes several workflows. All artefacts are written under `generated/{d
    - Report error envelopes plus LOYO diagnostics (global RMSE and skill) for temperature, specific humidity, and pressure.
    - Export the learned parameters and metadata to `generated/models/{country_code}_{station_slug}_temperature.json`, `generated/models/{country_code}_{station_slug}_specific_humidity.json`, and `generated/models/{country_code}_{station_slug}_pressure.json`.
    - Persist per-year LOYO metrics to `generated/models/training_metrics/{country_code}_{station_slug}_{target}_training_metrics.{json,csv}` and store the global RMSE/skill summaries on the model metadata (`training_loyo_rmse`, `training_loyo_skill`).
+   - Fit a residual sparse VAR model on the temperature, specific humidity, and pressure residuals and export it to `generated/models/{country_code}_{station_slug}_stochastic.json` for downstream simulations and stochastic plots.
    - Generate a C++ header (`generated/templates/{country_code}_{station_slug}.hpp`) with inline prediction helpers.
 
 2. **Regenerate outputs from an existing model JSON.**
@@ -134,11 +141,12 @@ The CLI exposes several workflows. All artefacts are written under `generated/{d
    ```bash
    python main.py display fr_bourges_temperature.json --mode intraday --day 42
    ```
-- The default (`--mode=annual`) resolves the companion humidity and pressure models automatically and saves a composite figure (temperature, specific humidity in g/kg, and pressure) to `generated/media/fr_bourges_annual.png`.
-- Intraday mode renders a single-day solar-time profile (`generated/media/fr_bourges_intraday_100.png`) and requires the `--day` argument.
-- Pass `--variables <codes...>` to control which panels render. The default is `T Q P`; include `RH`, `TD`, or `E` when you also need relative humidity, dew point, or vapor pressure (e.g. `--variables T RH TD Q E P`).
-- Historical overlays appear in both annual and intraday plots whenever the cached Parquet dataset exists under `generated/data/`.
-- Specific humidity plots display values in g/kg (coefficients remain stored in kg/kg).
+   - The default (`--mode=annual`) resolves the companion humidity and pressure models automatically and saves a composite figure (temperature, specific humidity in g/kg, and pressure) to `generated/media/fr_bourges_annual.png`.
+   - Intraday mode renders a single-day solar-time profile (`generated/media/fr_bourges_intraday_100.png`) and requires the `--day` argument.
+   - Stochastic modes simulate variability using the residual sparse VAR export: use `--mode stochastic_annual` for a year-long envelope (`generated/media/fr_bourges_stochastic_annual.png`) or `--mode stochastic_intraday --day 100` for a daily trace (`generated/media/fr_bourges_stochastic_intraday_100.png`). Passing a `_stochastic.json` file automatically switches to stochastic mode unless you override the mode.
+   - Pass `--variables <codes...>` to control which panels render. The default is `T Q P`; include `RH`, `TD`, or `E` when you also need relative humidity, dew point, or vapor pressure (e.g. `--variables T RH TD Q E P`).
+   - Historical overlays appear in both annual and intraday plots whenever the cached Parquet dataset exists under `generated/data/`.
+   - Specific humidity plots display values in g/kg (coefficients remain stored in kg/kg).
 
 4. **Generate an embedded template for existing models.**
    ```bash
@@ -161,6 +169,7 @@ The CLI exposes several workflows. All artefacts are written under `generated/{d
    ```
    - Iterates over each station represented in `generated/models/`, using one bundle as the seed to render the annual composite figure via `python main.py display`.
    - Immediately replays the command with `--mode intraday --day 100` (when a temperature bundle exists) so every station ships a matching solar-day profile.
+   - When a `_stochastic.json` is present, it also renders stochastic annual and day-100 intraday simulations to keep deterministic and stochastic dashboards aligned.
    - Stores the annual and intraday PNGs side by side under `generated/media/`, keeping the dashboard assets synchronized after retraining.
 
 7. **Backwards-compatible default.**

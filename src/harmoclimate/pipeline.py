@@ -10,8 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
+import pandas as pd
+
 from .config import (
     ANNUAL_HARMONICS_PER_PARAM,
+    AUTHOR_NAME,
     COUNTRY_CODE,
     DATA_DIR,
     DEFAULT_ANNUAL_HARMONICS,
@@ -27,7 +30,11 @@ from .config import (
     compute_output_basename,
     slugify_station_name,
 )
-from .core import load_parquet_dataset
+from .core import (
+    load_parquet_dataset,
+    model_daily_stats_one_year_factorized,
+    simulate_stochastic_year,
+)
 from .data_ingest import StationRecord, StreamResult, stream_filter_to_disk
 from .metadata import StationMetadata, summarize_station
 from .template_cpp import generate_cpp_header
@@ -35,19 +42,23 @@ from .evaluation import evaluate_loyo
 from .training import (
     LinearModelFit,
     RIDGE_LAMBDA_DEFAULT,
+    StochasticModelFit,
     build_parameter_payload,
     compute_sufficient_stats,
     prepare_training_frame,
     train_models,
+    train_stochastic_model,
 )
 from .display import (
     historical_climatology_daily,
     load_history_from_sample_data,
     load_linear_model,
-    model_daily_stats_one_year_factorized,
+    load_stochastic_model,
     normalize_display_variables,
     plot_intraday,
     plot_year,
+    plot_stochastic_year,
+    plot_stochastic_intraday,
 )
 _TARGET_SUFFIXES = {
     "T": "_temperature",
@@ -126,6 +137,55 @@ def _export_training_metrics_files(model: LinearModelFit, model_path: Path) -> N
         )
 
 
+def _export_stochastic_model(
+    model: StochasticModelFit,
+    base_path: Path,
+    metadata: dict[str, object],
+    generation_date: str,
+) -> None:
+    """Export the stochastic model to a JSON file."""
+    
+    # Construct path: {station_slug}_stochastic.json
+    # base_path is like .../models/fr_bourges_temperature.json
+    # We want .../models/fr_bourges_stochastic.json
+    
+    # We can derive the station slug from the base path or pass it in.
+    # Using _slug_from_model_path logic might be safer if available, 
+    # but here we can just use the parent directory and a constructed filename 
+    # if we assume base_path follows the standard naming.
+    # However, let's try to be robust.
+    
+    # Actually, let's just use the directory of base_path and the station code/slug from metadata if possible,
+    # or derive from base_path stem.
+    
+    # Let's assume the caller handles the path generation or we do it here.
+    # In _finalize_pipeline we have artifact_paths.
+    
+    # Let's define the payload first.
+    payload = {
+        "metadata": {
+            "version": "1.0",
+            "model_type": model.model_type,
+            "author": metadata.get("author", "HarmoClimate"),
+            "generated_at_utc": generation_date,
+            "station_code": metadata.get("station_code"),
+            "station_usual_name": metadata.get("station_usual_name"),
+            "variables": model.variables,
+            "lags": model.lags,
+        },
+        "model": {
+            "coefficient_matrix": model.coefficient_matrix_list(),
+            "covariance_matrix": model.covariance_matrix_list(),
+            "skew_normal_params": model.skew_normal_params,
+        },
+    }
+    
+    with open(base_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    
+    print(f"[OK] Stochastic model exported to {base_path}")
+
+
 def clean_pipeline() -> list[Path]:
     """Remove cached Parquet datasets under the generated data directory."""
 
@@ -146,9 +206,24 @@ def clean_pipeline() -> list[Path]:
     return removed
 
 
+def _iso_utc(value) -> str | None:
+    """Convert a timestamp to an ISO 8601 string in UTC."""
+    if value is None:
+        return None
+    if hasattr(value, "to_pydatetime"):
+        value = value.to_pydatetime()
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        else:
+            value = value.astimezone(timezone.utc)
+        return value.isoformat()
+    return None
+
+
 def _finalize_pipeline(
     *,
-    df,
+    df: pd.DataFrame,
     artifact_paths: ArtifactPaths,
     station_records: Iterable[StationRecord],
     station_name: str,
@@ -198,67 +273,37 @@ def _finalize_pipeline(
         "ridge_lambda": float(ridge_lambda),
     }
 
-    stats_T = compute_sufficient_stats(
-        prepared,
-        target="T",
-        n_diurnal=N_DIURNAL_HARMONICS,
-        default_n_annual=DEFAULT_ANNUAL_HARMONICS,
-        annual_per_param=annual_overrides,
-    )
-    report_T = evaluate_loyo(
-        stats_T,
-        ridge_lambda=ridge_lambda,
-        reference_spec=dict(reference_template),
-    )
     evaluation_meta = {
         "evaluation_time_base": "UTC",
         "model_time_base": "solar",
         "baseline": "climatology_mean per (utc_day, utc_hour), LOYO",
     }
-    report_T.hyperparameters = {
-        "model": dict(model_spec),
-        "reference": dict(reference_template),
-        **evaluation_meta,
-    }
-    result.temperature_model.validation = report_T
 
-    stats_Q = compute_sufficient_stats(
-        prepared,
-        target="Q",
-        n_diurnal=N_DIURNAL_HARMONICS,
-        default_n_annual=DEFAULT_ANNUAL_HARMONICS,
-        annual_per_param=annual_overrides,
-    )
-    report_Q = evaluate_loyo(
-        stats_Q,
-        ridge_lambda=ridge_lambda,
-        reference_spec=dict(reference_template),
-    )
-    report_Q.hyperparameters = {
-        "model": dict(model_spec),
-        "reference": dict(reference_template),
-        **evaluation_meta,
+    model_fits = {
+        "T": result.temperature_model,
+        "Q": result.specific_humidity_model,
+        "P": result.pressure_model,
     }
-    result.specific_humidity_model.validation = report_Q
 
-    stats_P = compute_sufficient_stats(
-        prepared,
-        target="P",
-        n_diurnal=N_DIURNAL_HARMONICS,
-        default_n_annual=DEFAULT_ANNUAL_HARMONICS,
-        annual_per_param=annual_overrides,
-    )
-    report_P = evaluate_loyo(
-        stats_P,
-        ridge_lambda=ridge_lambda,
-        reference_spec=dict(reference_template),
-    )
-    report_P.hyperparameters = {
-        "model": dict(model_spec),
-        "reference": dict(reference_template),
-        **evaluation_meta,
-    }
-    result.pressure_model.validation = report_P
+    for target, model in model_fits.items():
+        stats = compute_sufficient_stats(
+            prepared,
+            target=target,
+            n_diurnal=N_DIURNAL_HARMONICS,
+            default_n_annual=DEFAULT_ANNUAL_HARMONICS,
+            annual_per_param=annual_overrides,
+        )
+        report = evaluate_loyo(
+            stats,
+            ridge_lambda=ridge_lambda,
+            reference_spec=dict(reference_template),
+        )
+        report.hyperparameters = {
+            "model": dict(model_spec),
+            "reference": dict(reference_template),
+            **evaluation_meta,
+        }
+        model.validation = report
 
     temp_metrics = result.temperature_model.metrics
     q_metrics = result.specific_humidity_model.metrics
@@ -272,19 +317,6 @@ def _finalize_pipeline(
     source_data_utc_end = None
     if "DT_UTC" in df.columns:
         dt_series = df["DT_UTC"].dropna()
-
-        def _iso_utc(value) -> str | None:
-            if value is None:
-                return None
-            if hasattr(value, "to_pydatetime"):
-                value = value.to_pydatetime()
-            if isinstance(value, datetime):
-                if value.tzinfo is None:
-                    value = value.replace(tzinfo=timezone.utc)
-                else:
-                    value = value.astimezone(timezone.utc)
-                return value.isoformat()
-            return None
 
         if not dt_series.empty:
             source_data_utc_start = _iso_utc(dt_series.min())
@@ -302,11 +334,6 @@ def _finalize_pipeline(
     }
 
     generation_date = datetime.now(timezone.utc).isoformat()
-    model_fits = {
-        "T": result.temperature_model,
-        "Q": result.specific_humidity_model,
-        "P": result.pressure_model,
-    }
 
     payloads: dict[str, dict] = {}
     artifact_paths.model_temperature_json.parent.mkdir(parents=True, exist_ok=True)
@@ -327,11 +354,57 @@ def _finalize_pipeline(
             json.dump(payload, handle, indent=2)
         print(f"[OK] {payload['metadata']['target_variable']} parameters exported to {path}")
 
+    # Train and export stochastic model
+    stochastic_payload = None
+    print("[Info] Training stochastic residual model...")
+    try:
+        stochastic_model = train_stochastic_model(result, prepared)
+        
+        # Determine path for stochastic model
+        # We use the same directory as other models
+        model_dir = artifact_paths.model_temperature_json.parent
+        
+        # Derive base name from temperature model path to ensure consistency (e.g. fr_bourges)
+        temp_stem = artifact_paths.model_temperature_json.stem
+        temp_suffix = _TARGET_SUFFIXES["T"]
+        if temp_stem.endswith(temp_suffix):
+            base_name = temp_stem[:-len(temp_suffix)]
+        else:
+            base_name = temp_stem
+            
+        stochastic_json_path = model_dir / f"{base_name}_stochastic.json"
+        
+        stochastic_payload = {
+            "metadata": {
+                "version": "1.0",
+                "model_type": stochastic_model.model_type,
+                "author": metadata_payload.get("author", AUTHOR_NAME),
+                "generated_at_utc": generation_date,
+                "station_code": metadata_payload.get("station_code"),
+                "station_usual_name": metadata_payload.get("station_usual_name"),
+                "variables": stochastic_model.variables,
+                "lags": stochastic_model.lags,
+            },
+            "model": {
+                "coefficient_matrix": stochastic_model.coefficient_matrix_list(),
+                "covariance_matrix": stochastic_model.covariance_matrix_list(),
+                "skew_normal_params": stochastic_model.skew_normal_params,
+            },
+        }
+
+        with open(stochastic_json_path, "w", encoding="utf-8") as handle:
+            json.dump(stochastic_payload, handle, indent=2)
+        print(f"[OK] Stochastic model exported to {stochastic_json_path}")
+
+    except Exception as e:
+        print(f"[Warn] Failed to train/export stochastic model: {e}")
+
     generate_cpp_header(
         payloads["T"],
         payloads["Q"],
         payloads["P"],
         artifact_paths.cpp_header,
+        stochastic_payload=stochastic_payload,
     )
 
     return station_meta
@@ -397,6 +470,9 @@ def _slug_from_model_path(model_path: Path) -> str:
         if basename.endswith(suffix):
             basename = basename[: -len(suffix)]
             break
+    
+    if basename.endswith("_stochastic"):
+        basename = basename[:-len("_stochastic")]
 
     return basename
 
@@ -421,14 +497,22 @@ def _apply_model_path_override(
 
     stem = model_path.stem
     base_stem = stem[:-len(suffix)] if suffix and stem.endswith(suffix) else stem
+    if base_stem.endswith("_stochastic"):
+        base_stem = base_stem[:-len("_stochastic")]
 
     model_dir = model_path.parent
     derived_paths = {
         target: model_dir / f"{base_stem}{suffix_value}{model_path.suffix}"
         for target, suffix_value in _TARGET_SUFFIXES.items()
     }
-    derived_paths[detected_target] = model_path
-
+    
+    if not model_path.stem.endswith("_stochastic"):
+        derived_paths[detected_target] = model_path
+    
+    # If target is stochastic, we don't override a specific model path in the artifact paths
+    # but we ensure the derived paths are correct for T, Q, P.
+    # The ArtifactPaths struct doesn't have a stochastic path field, but that's fine.
+    
     if (
         derived_paths["T"] == base_paths.model_temperature_json
         and derived_paths["Q"] == base_paths.model_specific_humidity_json
@@ -456,6 +540,9 @@ def _normalize_model_basename(candidate: str) -> str:
         if name.endswith(suffix):
             name = name[: -len(suffix)]
             break
+    
+    if name.endswith("_stochastic"):
+        name = name[:-len("_stochastic")]
 
     prefix = f"{COUNTRY_CODE.lower()}_"
     if name.startswith(prefix):
@@ -571,18 +658,56 @@ def display_pipeline(
     ensure_directories()
 
     mode_normalized = (mode or "annual").strip().lower()
-    if mode_normalized not in {"annual", "intraday"}:
-        raise ValueError(f"Unsupported display mode '{mode}'. Expected 'annual' or 'intraday'.")
-    if mode_normalized == "intraday":
+    if mode_normalized not in {"annual", "intraday", "stochastic_annual", "stochastic_intraday"}:
+        raise ValueError(f"Unsupported display mode '{mode}'. Expected 'annual', 'intraday', 'stochastic_annual', or 'stochastic_intraday'.")
+    if "intraday" in mode_normalized:
         if day is None:
-            raise ValueError("The 'intraday' mode requires a --day argument.")
+            raise ValueError(f"The '{mode_normalized}' mode requires a --day argument.")
         day_int = int(day)
     else:
         day_int = None
 
     model_path = _resolve_model_path(model_json)
+    
+    # Check if this is a stochastic model file
+    is_stochastic_file = model_path.name.endswith("_stochastic.json")
+    
+    if is_stochastic_file:
+        # If user passed a stochastic file, we assume they want stochastic display unless specified otherwise
+        # But if they passed mode="annual", we might want to switch to "stochastic_annual" automatically?
+        # Or just proceed.
+        if mode_normalized == "annual":
+            mode_normalized = "stochastic_annual"
+        elif mode_normalized == "intraday":
+            mode_normalized = "stochastic_intraday"
+            
     display_variables = normalize_display_variables(variables)
-    base_payload = load_linear_model(model_path)
+    
+    # Load models
+    # If stochastic mode, we need T, Q, P and Stochastic
+    # If normal mode, we need T, Q, P (one of them is base_payload)
+    
+    if "stochastic" in mode_normalized:
+        if not is_stochastic_file:
+             # Try to find stochastic model if not passed directly
+             # Assuming model_path is one of the harmonic models
+             stem = model_path.stem
+             # Remove suffix
+             base_stem = stem
+             for suffix in _TARGET_SUFFIXES.values():
+                 if stem.endswith(suffix):
+                     base_stem = stem[:-len(suffix)]
+                     break
+             stochastic_path = model_path.parent / f"{base_stem}_stochastic.json"
+             if not stochastic_path.exists():
+                 raise FileNotFoundError(f"Stochastic model not found at {stochastic_path} for mode {mode_normalized}")
+        else:
+             stochastic_path = model_path
+             
+        stochastic_payload = load_stochastic_model(stochastic_path)
+        base_payload = stochastic_payload # Use this for metadata
+    else:
+        base_payload = load_linear_model(model_path)
 
     metadata = base_payload.get("metadata", {})
     station_name = str(
@@ -601,6 +726,7 @@ def display_pipeline(
     artifact_paths = build_artifact_paths(station_slug)
     station_basename = compute_output_basename(station_slug)
 
+    # Determine target variable for path override logic (less relevant for stochastic but good for consistency)
     target_variable_raw = str(metadata.get("target_variable") or "").strip().upper()
     if target_variable_raw in _TARGET_SUFFIXES:
         target_variable = target_variable_raw
@@ -612,7 +738,8 @@ def display_pipeline(
                 break
         target_variable = detected or "T"
 
-    artifact_paths = _apply_model_path_override(artifact_paths, model_path, target_variable)
+    if not is_stochastic_file:
+        artifact_paths = _apply_model_path_override(artifact_paths, model_path, target_variable)
 
     model_map = {
         "T": artifact_paths.model_temperature_json,
@@ -621,10 +748,8 @@ def display_pipeline(
     }
 
     payloads = {}
+    # Load harmonic models
     for key, path in model_map.items():
-        if key == target_variable:
-            payloads[key] = base_payload
-            continue
         if not path.exists():
             raise FileNotFoundError(
                 f"Missing required model JSON for target '{key}' at {path}. "
@@ -636,14 +761,18 @@ def display_pipeline(
 
     hist_daily = None
     hourly_hist = None
+    real_df = None
+    
     if artifact_paths.parquet.exists():
         try:
             sample_df = load_history_from_sample_data(artifact_paths.parquet)
+            real_df = sample_df # Keep full df for stochastic comparison
             hist_daily, hourly_hist = historical_climatology_daily(sample_df)
         except Exception as exc:  # pragma: no cover - defensive logging
             print(f"[Warn] Failed to load historical dataset for overlays: {exc}")
             hist_daily = None
             hourly_hist = None
+            real_df = None
     else:
         print(
             f"[Info] No cached dataset found at {artifact_paths.parquet}; plots will omit historical overlays.",
@@ -661,28 +790,8 @@ def display_pipeline(
             save_path=media_path,
             variables=display_variables,
         )
-    else:
-        (
-            days,
-            Tmin,
-            Tmax,
-            Tavg,
-            RHmin,
-            RHmax,
-            RHavg,
-            Tdmin,
-            Tdmax,
-            Tdavg,
-            Qmin,
-            Qmax,
-            Qavg,
-            Emin,
-            Emax,
-            Eavg,
-            Pmin,
-            Pmax,
-            Pavg,
-        ) = model_daily_stats_one_year_factorized(
+    elif mode_normalized == "annual":
+        days, stats = model_daily_stats_one_year_factorized(
             payloads["T"],
             payloads["Q"],
             payloads["P"],
@@ -691,27 +800,45 @@ def display_pipeline(
         media_path = MEDIA_DIR / f"{station_basename}_annual.png"
         plot_year(
             days,
-            Tmin,
-            Tmax,
-            Tavg,
-            RHmin,
-            RHmax,
-            RHavg,
-            Tdmin,
-            Tdmax,
-            Tdavg,
-            Qmin,
-            Qmax,
-            Qavg,
-            Emin,
-            Emax,
-            Eavg,
-            Pmin,
-            Pmax,
-            Pavg,
+            stats,
             station_name,
             media_path,
             hist_daily=hist_daily,
+            variables=display_variables,
+        )
+    elif mode_normalized == "stochastic_annual":
+        print(f"[Info] Generating stochastic annual simulation for {station_name}...")
+        sim_df = simulate_stochastic_year(
+            payloads["T"],
+            payloads["Q"],
+            payloads["P"],
+            stochastic_payload,
+            year=2010 # Use a complete historical year
+        )
+        media_path = MEDIA_DIR / f"{station_basename}_stochastic_annual.png"
+        plot_stochastic_year(
+            sim_df,
+            station_name,
+            save_path=media_path,
+            real_df=real_df,
+            variables=display_variables,
+        )
+    elif mode_normalized == "stochastic_intraday":
+        print(f"[Info] Generating stochastic intraday simulation for {station_name} (Day {day_int})...")
+        sim_df = simulate_stochastic_year(
+            payloads["T"],
+            payloads["Q"],
+            payloads["P"],
+            stochastic_payload,
+            year=2010
+        )
+        media_path = MEDIA_DIR / f"{station_basename}_stochastic_intraday_{day_int:03d}.png"
+        plot_stochastic_intraday(
+            sim_df,
+            station_name,
+            day=day_int,
+            save_path=media_path,
+            real_df=real_df,
             variables=display_variables,
         )
 
@@ -744,12 +871,23 @@ def template_pipeline(model_name: str, target_language: str) -> Path:
     specific_humidity_payload = load_linear_model(specific_humidity_path)
     pressure_payload = load_linear_model(pressure_path)
 
+    stochastic_path = MODEL_DIR / f"{basename}_stochastic.json"
+    stochastic_payload = None
+    if stochastic_path.exists():
+        try:
+            stochastic_payload = load_stochastic_model(stochastic_path)
+        except Exception as e:
+            print(f"[Warn] Found stochastic model but failed to load it: {e}")
+    else:
+        print(f"[Info] No stochastic model found at {stochastic_path}; template will exclude it.")
+
     header_path = TEMPLATE_DIR / f"{basename}.hpp"
     generate_cpp_header(
         temperature_payload,
         specific_humidity_payload,
         pressure_payload,
         header_path,
+        stochastic_payload=stochastic_payload,
     )
 
     return header_path

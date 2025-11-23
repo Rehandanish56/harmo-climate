@@ -23,6 +23,56 @@ from .training import (
 )
 
 
+def _accumulate_climatology_arrays(
+    stats: List[YearlyDesignStats],
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    Dict[int, Tuple[np.ndarray, np.ndarray]],
+]:
+    """Accumulate per-grid sums/counts using numpy arrays.
+    
+    Returns:
+        total_sum_arr: (367, 24) float array
+        total_count_arr: (367, 24) int array
+        yearly_data: Dict[year, (sum_arr, count_arr)]
+    """
+    # Shape: (367, 24) to cover days 1-366 (index 0 unused) and hours 0-23
+    shape = (367, 24)
+    total_sum = np.zeros(shape, dtype=float)
+    total_count = np.zeros(shape, dtype=int)
+    yearly_data = {}
+
+    for stat in stats:
+        # Filter valid indices
+        valid = (
+            (stat.utc_day_index >= 1)
+            & (stat.utc_day_index <= 366)
+            & (stat.utc_hour >= 0)
+            & (stat.utc_hour < 24)
+            & np.isfinite(stat.y)
+        )
+        
+        days = stat.utc_day_index[valid]
+        hours = stat.utc_hour[valid]
+        vals = stat.y[valid]
+        
+        # Accumulate for this year
+        year_sum = np.zeros(shape, dtype=float)
+        year_count = np.zeros(shape, dtype=int)
+        
+        np.add.at(year_sum, (days, hours), vals)
+        np.add.at(year_count, (days, hours), 1)
+        
+        yearly_data[stat.year] = (year_sum, year_count)
+        
+        # Accumulate to total
+        total_sum += year_sum
+        total_count += year_count
+        
+    return total_sum, total_count, yearly_data
+
+
 def accumulate_climatology_maps(
     stats: List[YearlyDesignStats],
 ) -> Tuple[
@@ -36,33 +86,27 @@ def accumulate_climatology_maps(
     Returns dictionaries for (utc_day_index, utc_hour) → value, keeping both the
     global aggregates and per-year contributions to support held-out exclusion.
     """
+    total_sum_arr, total_count_arr, yearly_data_arr = _accumulate_climatology_arrays(stats)
+    
+    # Convert arrays to dicts for backward compatibility
+    def arr_to_dict(arr, dtype):
+        d = {}
+        rows, cols = np.nonzero(arr)
+        for r, c in zip(rows, cols):
+            d[(int(r), int(c))] = dtype(arr[r, c])
+        return d
 
-    total_sum = defaultdict(float)
-    total_count = defaultdict(int)
-    yearly_sum: Dict[int, Dict[Tuple[int, int], float]] = {}
-    yearly_count: Dict[int, Dict[Tuple[int, int], int]] = {}
+    total_sum = arr_to_dict(total_sum_arr, float)
+    total_count = arr_to_dict(total_count_arr, int)
+    
+    yearly_sum = {}
+    yearly_count = {}
+    
+    for year, (y_sum, y_count) in yearly_data_arr.items():
+        yearly_sum[year] = arr_to_dict(y_sum, float)
+        yearly_count[year] = arr_to_dict(y_count, int)
 
-    for stat in stats:
-        sums = defaultdict(float)
-        counts = defaultdict(int)
-
-        for utc_day, utc_hour, val in zip(stat.utc_day_index, stat.utc_hour, stat.y):
-            day = int(utc_day)
-            hour = int(utc_hour)
-            if 1 <= day <= 365 and 0 <= hour < 24 and np.isfinite(val):
-                key = (day, hour)
-                sums[key] += float(val)
-                counts[key] += 1
-
-        yearly_sum[stat.year] = dict(sums)
-        yearly_count[stat.year] = dict(counts)
-
-        for key, value in sums.items():
-            total_sum[key] += value
-        for key, value in counts.items():
-            total_count[key] += value
-
-    return dict(total_sum), dict(total_count), yearly_sum, yearly_count
+    return total_sum, total_count, yearly_sum, yearly_count
 
 
 def evaluate_loyo(
@@ -105,7 +149,8 @@ def evaluate_loyo(
         b_total += entry.b
         total_obs += entry.n
 
-    total_sum, total_count, yearly_sum, yearly_count = accumulate_climatology_maps(stats)
+    # Use vectorized accumulation
+    total_sum_arr, total_count_arr, yearly_data_arr = _accumulate_climatology_arrays(stats)
 
     year_metrics: List[YearlyValidationMetrics] = []
     weighted_mse = 0.0
@@ -125,29 +170,56 @@ def evaluate_loyo(
         y_pred = stat.X @ beta
         residuals_model = stat.y - y_pred
 
-        sums_excl = yearly_sum.get(year, {})
-        counts_excl = yearly_count.get(year, {})
-
-        valid_mask = np.zeros(stat.n, dtype=bool)
+        # Vectorized reference calculation
+        # Get excluded sums/counts
+        year_sum_arr, year_count_arr = yearly_data_arr.get(year, (np.zeros_like(total_sum_arr), np.zeros_like(total_count_arr)))
+        
+        sum_excl_arr = total_sum_arr - year_sum_arr
+        count_excl_arr = total_count_arr - year_count_arr
+        
+        # Map stat indices to array indices
+        # Filter invalid indices first
+        valid_indices = (
+            (stat.utc_day_index >= 1)
+            & (stat.utc_day_index <= 366)
+            & (stat.utc_hour >= 0)
+            & (stat.utc_hour < 24)
+        )
+        
+        # Initialize ref_values with NaNs
         ref_values = np.full(stat.n, np.nan, dtype=float)
+        
+        # Only compute for valid indices
+        if np.any(valid_indices):
+            days = stat.utc_day_index[valid_indices]
+            hours = stat.utc_hour[valid_indices]
+            
+            # Get counts for these points
+            counts = count_excl_arr[days, hours]
+            sums = sum_excl_arr[days, hours]
+            
+            # Where count > 0, compute mean
+            valid_ref = counts > 0
+            
+            # We need to map back to the original `stat` array indices
+            # valid_indices is a boolean mask of length stat.n
+            # valid_ref is a boolean mask of length valid_indices.sum()
+            
+            # Create a mask for where we have a valid reference value
+            # It must be a valid index AND have enough data in the baseline
+            final_mask_subset = valid_ref
+            
+            # Calculate means where possible
+            means = sums[valid_ref] / counts[valid_ref]
+            
+            # Assign back to ref_values
+            # We need indices in the original array where valid_indices is True AND valid_ref is True
+            # np.where(valid_indices)[0] gives indices where valid_indices is True
+            # We take the subset of those where valid_ref is True
+            target_indices = np.where(valid_indices)[0][valid_ref]
+            ref_values[target_indices] = means
 
-        for idx in range(stat.n):
-            utc_day = int(stat.utc_day_index[idx])
-            utc_hour = int(stat.utc_hour[idx])
-            if not (1 <= utc_day <= 365 and 0 <= utc_hour < 24):
-                continue
-
-            key = (utc_day, utc_hour)
-            total_cnt = total_count.get(key, 0)
-            cnt_excl = total_cnt - counts_excl.get(key, 0)
-            if cnt_excl <= 0:
-                continue
-
-            sum_excl = total_sum.get(key, 0.0) - sums_excl.get(key, 0.0)
-            ref_values[idx] = sum_excl / cnt_excl
-            valid_mask[idx] = True
-
-        finite_mask = valid_mask & np.isfinite(residuals_model) & np.isfinite(ref_values)
+        finite_mask = np.isfinite(residuals_model) & np.isfinite(ref_values)
         if not np.any(finite_mask):
             continue
 

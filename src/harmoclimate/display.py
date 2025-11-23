@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Sequence, Tuple, Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -13,7 +14,17 @@ import pandas as pd
 from matplotlib.figure import Figure
 
 from .config import SAMPLES_PER_DAY
-from .core import SOLAR_YEAR_DAYS, load_parquet_dataset, prepare_dataset
+from .core import (
+    SOLAR_YEAR_DAYS,
+    climate_predict_solar,
+    load_parquet_dataset,
+    load_stochastic_model,
+    model_daily_stats_one_year_factorized,
+    model_intraday_solar,
+    prepare_dataset,
+    predict_model_solar,
+    simulate_stochastic_year,
+)
 from .psychrometrics import (
     dew_point_c_from_e,
     relative_humidity_percent_from_specific,
@@ -25,6 +36,23 @@ HISTORY_LINEWIDTH = 1.5
 GRID_LINEWIDTH = 0.5
 DISPLAY_VARIABLE_CHOICES = ("T", "RH", "TD", "Q", "E", "P")
 DISPLAY_VARIABLE_DEFAULT = ("T", "Q", "P")
+
+
+@dataclass(frozen=True)
+class VariableConfig:
+    title: str
+    unit: str
+    scale: float = 1.0
+
+
+VARIABLE_METADATA = {
+    "T": VariableConfig("Temperature", "°C"),
+    "RH": VariableConfig("Relative humidity", "%"),
+    "TD": VariableConfig("Dew point", "°C"),
+    "Q": VariableConfig("Specific humidity", "g/kg", scale=1000.0),
+    "E": VariableConfig("Vapor pressure", "hPa"),
+    "P": VariableConfig("Pressure", "hPa"),
+}
 
 
 def normalize_display_variables(variables: Sequence[str] | None) -> Tuple[str, ...]:
@@ -84,209 +112,6 @@ def load_linear_model(json_path: Path) -> dict:
     return payload
 
 
-def _parameter_map(model_payload: dict) -> Dict[str, Tuple[np.ndarray, int]]:
-    """Return a mapping of parameter name -> (coefficients, n_annual)."""
-
-    model = model_payload["model"]
-    coefficients = model.get("coefficients", [])
-    layout = model.get("params_layout", [])
-
-    mapping: Dict[str, Tuple[np.ndarray, int]] = {}
-    for entry in layout:
-        name = entry["name"]
-        start = int(entry["start"])
-        length = int(entry["length"])
-        n_annual = int(entry["n_annual"])
-        coeff_slice = np.asarray(coefficients[start : start + length], dtype=np.float64)
-        mapping[name] = (coeff_slice, n_annual)
-    return mapping
-
-
-def _wrap_day(day: float) -> float:
-    period = SOLAR_YEAR_DAYS
-    day %= period
-    if day < 0.0:
-        day += period
-    return day
-
-
-def _wrap_hour(hour: float) -> float:
-    hour %= 24.0
-    if hour < 0.0:
-        hour += 24.0
-    return hour
-
-
-def _eval_annual(coeffs: np.ndarray, n_annual: int, day: float) -> float:
-    omega = 2.0 * math.pi / SOLAR_YEAR_DAYS
-    value = float(coeffs[0])
-    for k in range(1, n_annual + 1):
-        angle = k * omega * day
-        value += float(coeffs[2 * k - 1]) * math.cos(angle)
-        value += float(coeffs[2 * k]) * math.sin(angle)
-    return value
-
-
-def predict_model_solar(model_payload: dict, day_solar: float, hour_solar: float) -> float:
-    """Evaluate a linear model in solar coordinates."""
-
-    mapping = _parameter_map(model_payload)
-    if "c0" not in mapping:
-        raise ValueError("Model payload does not include mandatory parameter 'c0'.")
-
-    day = math.floor(_wrap_day(day_solar))
-    max_day_index = int(math.floor(SOLAR_YEAR_DAYS))
-    if day > max_day_index:
-        day = max_day_index
-    hour = _wrap_hour(hour_solar)
-
-    omega_hour = 2.0 * math.pi / 24.0
-    result = _eval_annual(*mapping["c0"], day)
-
-    n_diurnal = int(model_payload["model"].get("n_diurnal", 0))
-    for m in range(1, n_diurnal + 1):
-        cos_name = f"a{m}"
-        sin_name = f"b{m}"
-        if cos_name in mapping:
-            result += _eval_annual(*mapping[cos_name], day) * math.cos(m * omega_hour * hour)
-        if sin_name in mapping:
-            result += _eval_annual(*mapping[sin_name], day) * math.sin(m * omega_hour * hour)
-    return result
-
-
-def climate_predict_solar(
-    day_solar: float,
-    hour_solar: float,
-    temperature_model: dict,
-    specific_humidity_model: dict,
-    pressure_model: dict,
-) -> Tuple[float, float, float]:
-    """Return (temperature °C, specific humidity kg/kg, pressure hPa) in solar coordinates."""
-
-    temp_c = predict_model_solar(temperature_model, day_solar, hour_solar)
-    q = predict_model_solar(specific_humidity_model, day_solar, hour_solar)
-    p_hpa = predict_model_solar(pressure_model, day_solar, hour_solar)
-    return temp_c, q, p_hpa
-
-
-def model_daily_stats_one_year_factorized(
-    temperature_model: dict,
-    specific_humidity_model: dict,
-    pressure_model: dict,
-    n_days: int = int(math.floor(SOLAR_YEAR_DAYS)),
-    samples_per_day: int = SAMPLES_PER_DAY,
-) -> Tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-]:
-    """Compute model-driven daily envelopes for one full year."""
-
-    hours = np.linspace(0.0, 24.0, samples_per_day, endpoint=False)
-    days = np.arange(1, n_days + 1, dtype=int)
-
-    Tmin = np.empty(n_days)
-    Tmax = np.empty(n_days)
-    Tavg = np.empty(n_days)
-    RHmin = np.empty(n_days)
-    RHmax = np.empty(n_days)
-    RHavg = np.empty(n_days)
-    Tdmin = np.empty(n_days)
-    Tdmax = np.empty(n_days)
-    Tdavg = np.empty(n_days)
-    Qmin = np.empty(n_days)
-    Qmax = np.empty(n_days)
-    Qavg = np.empty(n_days)
-    Emin = np.empty(n_days)
-    Emax = np.empty(n_days)
-    Eavg = np.empty(n_days)
-    Pmin = np.empty(n_days)
-    Pmax = np.empty(n_days)
-    Pavg = np.empty(n_days)
-
-    for idx, d in enumerate(days):
-        temps: list[float] = []
-        q_vals: list[float] = []
-        pressures: list[float] = []
-        for h in hours:
-            temp_c, q, p_hpa = climate_predict_solar(
-                float(d),
-                float(h),
-                temperature_model,
-                specific_humidity_model,
-                pressure_model,
-            )
-            temps.append(temp_c)
-            q_vals.append(q)
-            pressures.append(p_hpa)
-        T_array = np.asarray(temps)
-        Q_array = np.asarray(q_vals)
-        P_array = np.asarray(pressures)
-        RH_array = relative_humidity_percent_from_specific(T_array, Q_array, P_array)
-        E_array = vapor_partial_pressure_hpa_from_q_p(Q_array, P_array)
-        Td_array = dew_point_c_from_e(E_array)
-
-        Tmin[idx] = float(T_array.min())
-        Tmax[idx] = float(T_array.max())
-        Tavg[idx] = float(T_array.mean())
-        RHmin[idx] = float(RH_array.min())
-        RHmax[idx] = float(RH_array.max())
-        RHavg[idx] = float(RH_array.mean())
-        Tdmin[idx] = float(Td_array.min())
-        Tdmax[idx] = float(Td_array.max())
-        Tdavg[idx] = float(Td_array.mean())
-        Qmin[idx] = float(Q_array.min())
-        Qmax[idx] = float(Q_array.max())
-        Qavg[idx] = float(Q_array.mean())
-        Emin[idx] = float(E_array.min())
-        Emax[idx] = float(E_array.max())
-        Eavg[idx] = float(E_array.mean())
-        Pmin[idx] = float(P_array.min())
-        Pmax[idx] = float(P_array.max())
-        Pavg[idx] = float(P_array.mean())
-
-    return (
-        days,
-        Tmin,
-        Tmax,
-        Tavg,
-        RHmin,
-        RHmax,
-        RHavg,
-        Tdmin,
-        Tdmax,
-        Tdavg,
-        Qmin,
-        Qmax,
-        Qavg,
-        Emin,
-        Emax,
-        Eavg,
-        Pmin,
-        Pmax,
-        Pavg,
-    )
-
-
 def load_history_from_sample_data(parquet_path: Path) -> pd.DataFrame:
     """Load the cached dataset and emit key columns for comparison plots."""
 
@@ -302,6 +127,7 @@ def load_history_from_sample_data(parquet_path: Path) -> pd.DataFrame:
             "P",
             "Q",
             "E",
+            "DT_UTC",
         ),
     )
     df = df.dropna(
@@ -316,8 +142,11 @@ def load_history_from_sample_data(parquet_path: Path) -> pd.DataFrame:
             "E",
         ],
     )
+
+    # Ensure day indices used in displays are 1-based to align with synthetic simulations
+    # (simulate_stochastic_year starts at day_solar=1).
     max_day_index = int(math.floor(SOLAR_YEAR_DAYS))
-    df["day"] = np.floor(df["yday_frac_solar"]).astype(int)
+    df["day"] = np.floor(df["yday_frac_solar"]).astype(int) + 1
     df.loc[df["day"] > max_day_index, "day"] = max_day_index
     df["hour"] = np.mod(df["hour_solar"].astype(float), 24.0)
     return df
@@ -359,26 +188,50 @@ def historical_climatology_daily(df: pd.DataFrame):
     return daily, grouped
 
 
+def _plot_variable_on_axis(
+    ax: plt.Axes,
+    code: str,
+    x_data: np.ndarray,
+    model_data: Dict[str, Any] | np.ndarray,
+    hist_data: Dict[str, Any] | np.ndarray | None = None,
+    x_data_hist: np.ndarray | None = None,
+    is_intraday: bool = False,
+):
+    config = VARIABLE_METADATA[code]
+    scale = config.scale
+    
+    ax.grid(True, which="both", linewidth=GRID_LINEWIDTH, alpha=0.4)
+    ax.set_ylabel(f"({config.unit})")
+    ax.set_title(config.title, loc="center", fontsize=11)
+
+    if is_intraday:
+        # model_data is array
+        ax.plot(x_data, model_data * scale, label="Model", linewidth=MODEL_LINEWIDTH)
+        if hist_data is not None and len(hist_data) > 0:
+            x_hist = x_data_hist if x_data_hist is not None else x_data
+            ax.plot(x_hist, hist_data * scale, "--", label="History mean", linewidth=HISTORY_LINEWIDTH, color="black")
+    else:
+        # model_data is dict with min/max/avg
+        mn = model_data["min"] * scale
+        mx = model_data["max"] * scale
+        avg = model_data["avg"] * scale
+        ax.fill_between(x_data, mn, mx, alpha=0.20, label="Model (min-max)")
+        ax.plot(x_data, avg, linewidth=MODEL_LINEWIDTH, label="Model mean")
+        
+        if hist_data is not None:
+             # hist_data is dict with min/max/mean
+            h_mn = hist_data["min"] * scale
+            h_mx = hist_data["max"] * scale
+            h_avg = hist_data["mean"] * scale
+            ax.fill_between(x_data, h_mn, h_mx, alpha=0.10, color="gray", label="History (min-max)")
+            ax.plot(x_data, h_avg, linewidth=HISTORY_LINEWIDTH, linestyle="--", color="black", label="History mean")
+
+    ax.legend(loc="best" if is_intraday else "upper right")
+
+
 def plot_year(
     days: np.ndarray,
-    Tmin: np.ndarray,
-    Tmax: np.ndarray,
-    Tavg: np.ndarray,
-    RHmin: np.ndarray,
-    RHmax: np.ndarray,
-    RHavg: np.ndarray,
-    Tdmin: np.ndarray,
-    Tdmax: np.ndarray,
-    Tdavg: np.ndarray,
-    Qmin: np.ndarray,
-    Qmax: np.ndarray,
-    Qavg: np.ndarray,
-    Emin: np.ndarray,
-    Emax: np.ndarray,
-    Eavg: np.ndarray,
-    Pmin: np.ndarray,
-    Pmax: np.ndarray,
-    Pavg: np.ndarray,
+    model_stats: Dict[str, Dict[str, np.ndarray]],
     station_name: str,
     save_path: Path | str | None = None,
     hist_daily: pd.DataFrame | None = None,
@@ -395,134 +248,48 @@ def plot_year(
     axis_map = {code: axes_list[idx] for idx, code in enumerate(enabled)}
     fig.suptitle(f"{station_name} — Annual model envelopes", fontsize=14)
 
-    hist_sorted = None
+    hist_stats = {}
     if hist_daily is not None and not hist_daily.empty:
         hist_sorted = hist_daily.sort_values("day")
-        hist_temp_min = hist_sorted["temp_min_c"].to_numpy(dtype=float)
-        hist_temp_max = hist_sorted["temp_max_c"].to_numpy(dtype=float)
-        hist_temp_mean = hist_sorted["temp_mean_c"].to_numpy(dtype=float)
-        hist_rh_min = hist_sorted["rh_min_percent"].to_numpy(dtype=float)
-        hist_rh_max = hist_sorted["rh_max_percent"].to_numpy(dtype=float)
-        hist_rh_mean = hist_sorted["rh_mean_percent"].to_numpy(dtype=float)
-        hist_td_min = hist_sorted["td_min_c"].to_numpy(dtype=float)
-        hist_td_max = hist_sorted["td_max_c"].to_numpy(dtype=float)
-        hist_td_mean = hist_sorted["td_mean_c"].to_numpy(dtype=float)
-        hist_q_min = hist_sorted["q_min_kg_kg"].to_numpy(dtype=float) * 1_000.0
-        hist_q_max = hist_sorted["q_max_kg_kg"].to_numpy(dtype=float) * 1_000.0
-        hist_q_mean = hist_sorted["q_mean_kg_kg"].to_numpy(dtype=float) * 1_000.0
-        hist_e_min = hist_sorted["e_min_hpa"].to_numpy(dtype=float)
-        hist_e_max = hist_sorted["e_max_hpa"].to_numpy(dtype=float)
-        hist_e_mean = hist_sorted["e_mean_hpa"].to_numpy(dtype=float)
-        hist_p_min = hist_sorted["p_min_hpa"].to_numpy(dtype=float)
-        hist_p_max = hist_sorted["p_max_hpa"].to_numpy(dtype=float)
-        hist_p_mean = hist_sorted["p_mean_hpa"].to_numpy(dtype=float)
+        # Pre-process history into dict structure to match model_stats structure roughly
+        # Mapping from our variable codes to dataframe columns
+        col_map = {
+            "T": "temp",
+            "RH": "rh",
+            "TD": "td",
+            "Q": "q",
+            "E": "e",
+            "P": "p"
+        }
+        unit_suffix_map = {
+            "T": "_c",
+            "RH": "_percent",
+            "TD": "_c",
+            "Q": "_kg_kg",
+            "E": "_hpa",
+            "P": "_hpa"
+        }
+        
+        for code in enabled:
+            base = col_map.get(code)
+            suffix = unit_suffix_map.get(code)
+            if base and suffix:
+                hist_stats[code] = {
+                    "min": hist_sorted[f"{base}_min{suffix}"].to_numpy(dtype=float),
+                    "max": hist_sorted[f"{base}_max{suffix}"].to_numpy(dtype=float),
+                    "mean": hist_sorted[f"{base}_mean{suffix}"].to_numpy(dtype=float),
+                }
 
     for code in enabled:
-        ax = axis_map[code]
-        ax.grid(True, which="both", linewidth=GRID_LINEWIDTH, alpha=0.4)
-        if code == "T":
-            ax.fill_between(days, Tmin, Tmax, alpha=0.20, label="Model (min-max)")
-            ax.plot(days, Tavg, linewidth=MODEL_LINEWIDTH, label="Model mean")
-            ax.set_ylabel("(°C)")
-            ax.set_title("Temperature", loc="center", fontsize=11)
-            if hist_sorted is not None:
-                ax.fill_between(days, hist_temp_min, hist_temp_max, alpha=0.10, color="gray", label="History (min-max)")
-                ax.plot(
-                    days,
-                    hist_temp_mean,
-                    linewidth=HISTORY_LINEWIDTH,
-                    linestyle="--",
-                    color="black",
-                    label="History mean",
-                )
-        elif code == "RH":
-            RHmin_pct = np.asarray(RHmin, dtype=float)
-            RHmax_pct = np.asarray(RHmax, dtype=float)
-            RHavg_pct = np.asarray(RHavg, dtype=float)
-            ax.fill_between(days, RHmin_pct, RHmax_pct, alpha=0.20, label="Model (min-max)")
-            ax.plot(days, RHavg_pct, linewidth=MODEL_LINEWIDTH, label="Model mean")
-            ax.set_ylabel("(%)")
-            ax.set_title("Relative humidity", loc="center", fontsize=11)
-            if hist_sorted is not None:
-                ax.fill_between(days, hist_rh_min, hist_rh_max, alpha=0.10, color="gray", label="History (min-max)")
-                ax.plot(
-                    days,
-                    hist_rh_mean,
-                    linewidth=HISTORY_LINEWIDTH,
-                    linestyle="--",
-                    color="black",
-                    label="History mean",
-                )
-        elif code == "TD":
-            Tdmin_c = np.asarray(Tdmin, dtype=float)
-            Tdmax_c = np.asarray(Tdmax, dtype=float)
-            Tdavg_c = np.asarray(Tdavg, dtype=float)
-            ax.fill_between(days, Tdmin_c, Tdmax_c, alpha=0.20, label="Model (min-max)")
-            ax.plot(days, Tdavg_c, linewidth=MODEL_LINEWIDTH, label="Model mean")
-            ax.set_ylabel("(°C)")
-            ax.set_title("Dew point", loc="center", fontsize=11)
-            if hist_sorted is not None:
-                ax.fill_between(days, hist_td_min, hist_td_max, alpha=0.10, color="gray", label="History (min-max)")
-                ax.plot(
-                    days,
-                    hist_td_mean,
-                    linewidth=HISTORY_LINEWIDTH,
-                    linestyle="--",
-                    color="black",
-                    label="History mean",
-                )
-        elif code == "Q":
-            Qmin_gkg = np.asarray(Qmin, dtype=float) * 1_000.0
-            Qmax_gkg = np.asarray(Qmax, dtype=float) * 1_000.0
-            Qavg_gkg = np.asarray(Qavg, dtype=float) * 1_000.0
-            ax.fill_between(days, Qmin_gkg, Qmax_gkg, alpha=0.20, label="Model (min-max)")
-            ax.plot(days, Qavg_gkg, linewidth=MODEL_LINEWIDTH, label="Model mean")
-            ax.set_ylabel("(g/kg)")
-            ax.set_title("Specific humidity", loc="center", fontsize=11)
-            if hist_sorted is not None:
-                ax.fill_between(days, hist_q_min, hist_q_max, alpha=0.10, color="gray", label="History (min-max)")
-                ax.plot(
-                    days,
-                    hist_q_mean,
-                    linewidth=HISTORY_LINEWIDTH,
-                    linestyle="--",
-                    color="black",
-                    label="History mean",
-                )
-        elif code == "E":
-            Emin_hpa = np.asarray(Emin, dtype=float)
-            Emax_hpa = np.asarray(Emax, dtype=float)
-            Eavg_hpa = np.asarray(Eavg, dtype=float)
-            ax.fill_between(days, Emin_hpa, Emax_hpa, alpha=0.20, label="Model (min-max)")
-            ax.plot(days, Eavg_hpa, linewidth=MODEL_LINEWIDTH, label="Model mean")
-            ax.set_ylabel("(hPa)")
-            ax.set_title("Vapor pressure", loc="center", fontsize=11)
-            if hist_sorted is not None:
-                ax.fill_between(days, hist_e_min, hist_e_max, alpha=0.10, color="gray", label="History (min-max)")
-                ax.plot(
-                    days,
-                    hist_e_mean,
-                    linewidth=HISTORY_LINEWIDTH,
-                    linestyle="--",
-                    color="black",
-                    label="History mean",
-                )
-        elif code == "P":
-            ax.fill_between(days, Pmin, Pmax, alpha=0.20, label="Model (min-max)")
-            ax.plot(days, Pavg, linewidth=MODEL_LINEWIDTH, label="Model mean")
-            ax.set_ylabel("(hPa)")
-            ax.set_title("Pressure", loc="center", fontsize=11)
-            if hist_sorted is not None:
-                ax.fill_between(days, hist_p_min, hist_p_max, alpha=0.10, color="gray", label="History (min-max)")
-                ax.plot(
-                    days,
-                    hist_p_mean,
-                    linewidth=HISTORY_LINEWIDTH,
-                    linestyle="--",
-                    color="black",
-                    label="History mean",
-                )
-        ax.legend(loc="upper right")
+        _plot_variable_on_axis(
+            axis_map[code],
+            code,
+            days,
+            model_stats[code],
+            hist_stats.get(code),
+            x_data_hist=days,
+            is_intraday=False
+        )
 
     axes_list[-1].set_xlabel("Day of year")
     plt.tight_layout(rect=(0, 0, 1, 0.97))
@@ -537,35 +304,6 @@ def plot_year(
 
     plt.show()
     return fig
-
-
-def model_intraday_solar(
-    temperature_model: dict,
-    specific_humidity_model: dict,
-    pressure_model: dict,
-    day_solar: int,
-    samples_per_day: int = SAMPLES_PER_DAY,
-):
-    hours = np.linspace(0.0, 24.0, samples_per_day, endpoint=False)
-    temps, qs, ps = [], [], []
-    for h in hours:
-        temp_c, q, p = climate_predict_solar(
-            float(day_solar),
-            float(h),
-            temperature_model,
-            specific_humidity_model,
-            pressure_model,
-        )
-        temps.append(temp_c)
-        qs.append(q)
-        ps.append(p)
-    temps_arr = np.asarray(temps, dtype=float)
-    qs_arr = np.asarray(qs, dtype=float)
-    ps_arr = np.asarray(ps, dtype=float)
-    e_arr = vapor_partial_pressure_hpa_from_q_p(qs_arr, ps_arr)
-    td_arr = dew_point_c_from_e(e_arr)
-    rh_arr = relative_humidity_percent_from_specific(temps_arr, qs_arr, ps_arr)
-    return hours, temps_arr, qs_arr, ps_arr, rh_arr, td_arr, e_arr
 
 
 def history_intraday_mean(hourly_hist: pd.DataFrame, day: int):
@@ -613,7 +351,7 @@ def plot_intraday(
     if day < 1 or day > max_day_index:
         raise ValueError(f"day must be within [1, {max_day_index}] (received {day}).")
 
-    h_mod, T_mod, Q_mod, P_mod, RH_mod, Td_mod, E_mod = model_intraday_solar(
+    h_mod, model_data = model_intraday_solar(
         temperature_model,
         specific_humidity_model,
         pressure_model,
@@ -621,15 +359,21 @@ def plot_intraday(
         samples_per_day=samples_per_day,
     )
 
+    hist_data = {}
     h_hist = np.array([])
-    T_hist = np.array([])
-    RH_hist = np.array([])
-    Td_hist = np.array([])
-    Q_hist = np.array([])
-    E_hist = np.array([])
-    P_hist = np.array([])
     if hourly_hist is not None:
+        # history_intraday_mean returns tuple: (h, T, RH, Td, Q, E, P)
+        # We need to map this to our dict structure
         h_hist, T_hist, RH_hist, Td_hist, Q_hist, E_hist, P_hist = history_intraday_mean(hourly_hist, day)
+        if len(h_hist) > 0:
+            hist_data = {
+                "T": T_hist,
+                "RH": RH_hist,
+                "TD": Td_hist,
+                "Q": Q_hist,
+                "E": E_hist,
+                "P": P_hist,
+            }
 
     enabled = normalize_display_variables(variables)
     axes_count = len(enabled)
@@ -639,50 +383,18 @@ def plot_intraday(
     axis_map = {code: axes_list[idx] for idx, code in enumerate(enabled)}
     fig.suptitle(f"{station_name} — Intraday profile (solar time) — day {day}", fontsize=12)
 
-    Q_mod_gkg = Q_mod * 1_000.0
-    Q_hist_gkg = Q_hist * 1_000.0 if len(h_hist) > 0 else Q_hist
-
     for code in enabled:
         ax = axis_map[code]
-        ax.grid(True, linewidth=GRID_LINEWIDTH, alpha=0.4)
         ax.set_xlim(0, 24)
-        if code == "T":
-            ax.plot(h_mod, T_mod, label="Model", linewidth=MODEL_LINEWIDTH)
-            if len(h_hist) > 0:
-                ax.plot(h_hist, T_hist, "--", label="History mean", linewidth=HISTORY_LINEWIDTH, color="black")
-            ax.set_ylabel("(°C)")
-            ax.set_title("Temperature", loc="center", fontsize=11)
-        elif code == "RH":
-            ax.plot(h_mod, RH_mod, label="Model", linewidth=MODEL_LINEWIDTH)
-            if len(h_hist) > 0:
-                ax.plot(h_hist, RH_hist, "--", label="History mean", linewidth=HISTORY_LINEWIDTH, color="black")
-            ax.set_ylabel("(%)")
-            ax.set_title("Relative humidity", loc="center", fontsize=11)
-        elif code == "TD":
-            ax.plot(h_mod, Td_mod, label="Model", linewidth=MODEL_LINEWIDTH)
-            if len(h_hist) > 0:
-                ax.plot(h_hist, Td_hist, "--", label="History mean", linewidth=HISTORY_LINEWIDTH, color="black")
-            ax.set_ylabel("(°C)")
-            ax.set_title("Dew point", loc="center", fontsize=11)
-        elif code == "Q":
-            ax.plot(h_mod, Q_mod_gkg, label="Model", linewidth=MODEL_LINEWIDTH)
-            if len(h_hist) > 0:
-                ax.plot(h_hist, Q_hist_gkg, "--", label="History mean", linewidth=HISTORY_LINEWIDTH, color="black")
-            ax.set_ylabel("(g/kg)")
-            ax.set_title("Specific humidity", loc="center", fontsize=11)
-        elif code == "E":
-            ax.plot(h_mod, E_mod, label="Model", linewidth=MODEL_LINEWIDTH)
-            if len(h_hist) > 0:
-                ax.plot(h_hist, E_hist, "--", label="History mean", linewidth=HISTORY_LINEWIDTH, color="black")
-            ax.set_ylabel("(hPa)")
-            ax.set_title("Vapor pressure", loc="center", fontsize=11)
-        elif code == "P":
-            ax.plot(h_mod, P_mod, label="Model", linewidth=MODEL_LINEWIDTH)
-            if len(h_hist) > 0:
-                ax.plot(h_hist, P_hist, "--", label="History mean", linewidth=HISTORY_LINEWIDTH, color="black")
-            ax.set_ylabel("(hPa)")
-            ax.set_title("Pressure", loc="center", fontsize=11)
-        ax.legend(loc="best")
+        _plot_variable_on_axis(
+            ax,
+            code,
+            h_mod,
+            model_data[code],
+            hist_data.get(code),
+            x_data_hist=h_hist,
+            is_intraday=True
+        )
 
     axes_list[-1].set_xlabel("Solar hour")
     plt.tight_layout()
@@ -698,6 +410,185 @@ def plot_intraday(
     plt.show()
     return fig
 
+
+def plot_stochastic_year(
+    sim_df: pd.DataFrame,
+    station_name: str,
+    save_path: Path | str | None = None,
+    real_df: pd.DataFrame | None = None,
+    variables: Sequence[str] | None = None,
+) -> Path | Figure:
+    """Render stochastic simulation vs real data for a full year."""
+    
+    enabled = normalize_display_variables(variables)
+    axes_count = len(enabled)
+    height = 4.0 + 1.8 * axes_count
+    fig, axes = plt.subplots(axes_count, 1, figsize=(12, height), sharex=True)
+    axes_list = [axes] if axes_count == 1 else list(axes)
+    axis_map = {code: axes_list[idx] for idx, code in enumerate(enabled)}
+    fig.suptitle(f"{station_name} — Stochastic Simulation vs Real Data", fontsize=14)
+    
+    # X-axis: day of year
+    sim_doy = sim_df["day_solar"]
+    
+    real_doy = None
+    sim_year = int(sim_df["DT_UTC"].dt.year.iloc[0]) if "DT_UTC" in sim_df.columns else None
+    real_label = f"Real Data ({sim_year})" if sim_year is not None else "Real Data"
+
+    if real_df is not None:
+        # Prefer aligning real data to the simulation year; fall back to latest year if absent
+        if "DT_UTC" in real_df.columns:
+            years = real_df["DT_UTC"].dt.year.unique()
+            target_year = sim_year if sim_year in years else years.max()
+            mask = real_df["DT_UTC"].dt.year == target_year
+            real_df_year = real_df[mask]
+            if not real_df_year.empty:
+                real_df = real_df_year
+                if sim_year != target_year:
+                    real_label = f"Real Data ({target_year})"
+
+        real_df = real_df.copy()
+        if "yday_frac_solar" in real_df.columns:
+            real_doy = real_df["yday_frac_solar"] + 1.0
+        elif "DT_UTC" in real_df.columns:
+            real_doy = real_df["DT_UTC"].dt.dayofyear + real_df["DT_UTC"].dt.hour / 24.0
+    
+    for code in enabled:
+        ax = axis_map[code]
+        config = VARIABLE_METADATA[code]
+        scale = config.scale
+        
+        ax.grid(True, which="both", linewidth=GRID_LINEWIDTH, alpha=0.4)
+        ax.set_ylabel(f"({config.unit})")
+        ax.set_title(config.title, loc="center", fontsize=11)
+        
+        # Plot Simulation
+        ax.plot(sim_doy, sim_df[code] * scale, label="Simulated", alpha=0.7, linewidth=0.8)
+        
+        # Plot Baseline (if available in sim_df, we added T_base etc)
+        base_col = f"{code}_base"
+        if base_col in sim_df.columns:
+             ax.plot(sim_doy, sim_df[base_col] * scale, label="Harmonic Baseline", color="k", linestyle="--", alpha=0.6, linewidth=1)
+        elif code in ["E", "TD", "RH"]:
+             # These are derived, so we don't have direct baseline columns in sim_df easily unless we computed them.
+             # For now, skip baseline for derived vars or compute them if needed.
+             pass
+
+        # Plot Real Data at native granularity to match simulation
+        if real_df is not None and real_doy is not None:
+            # Map code to column name in real_df
+            # real_df usually has T, Q, P, RH, E, Td
+            col_name = code
+            if code == "TD" and "Td" in real_df.columns:
+                col_name = "Td"
+             
+            if col_name in real_df.columns:
+                ax.plot(real_doy, real_df[col_name] * scale, label=real_label, alpha=0.4, linewidth=0.8)
+        
+        ax.legend(loc="upper right")
+        
+    axes_list[-1].set_xlabel("Day of year")
+    plt.tight_layout(rect=(0, 0, 1, 0.97))
+    
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=150)
+        plt.close(fig)
+        print(f"Figure saved -> {save_path}")
+        return save_path
+
+    plt.show()
+    return fig
+
+
+def plot_stochastic_intraday(
+    sim_df: pd.DataFrame,
+    station_name: str,
+    day: int,
+    save_path: Path | str | None = None,
+    real_df: pd.DataFrame | None = None,
+    variables: Sequence[str] | None = None,
+) -> Path | Figure:
+    """Render stochastic simulation vs real data for a specific day."""
+    
+    # Filter for the specific day; simulated day_solar is 1-based.
+    sim_day = sim_df[sim_df["day_solar"].astype(int) == day]
+    
+    real_day = None
+    if real_df is not None:
+        # Align real data year to simulation year when possible; otherwise use latest.
+        if "DT_UTC" in real_df.columns:
+            years = real_df["DT_UTC"].dt.year.unique()
+            target_year = sim_df["DT_UTC"].dt.year.iloc[0] if "DT_UTC" in sim_df.columns else years.max()
+            if target_year not in years:
+                target_year = years.max()
+            real_df = real_df[real_df["DT_UTC"].dt.year == target_year]
+
+        # Filter real data for the same day (approximate if years differ)
+        if "yday_frac_solar" in real_df.columns:
+             real_day = real_df[(np.floor(real_df["yday_frac_solar"]).astype(int) + 1) == day]
+        elif "DT_UTC" in real_df.columns:
+             real_day = real_df[real_df["DT_UTC"].dt.dayofyear == day]
+    
+    enabled = normalize_display_variables(variables)
+    axes_count = len(enabled)
+    height = 4.0 + 1.5 * axes_count
+    fig, axes = plt.subplots(axes_count, 1, figsize=(9, height), sharex=True)
+    axes_list = [axes] if axes_count == 1 else list(axes)
+    axis_map = {code: axes_list[idx] for idx, code in enumerate(enabled)}
+    fig.suptitle(f"{station_name} — Stochastic Intraday (Day {day})", fontsize=12)
+    
+    for code in enabled:
+        ax = axis_map[code]
+        config = VARIABLE_METADATA[code]
+        scale = config.scale
+        
+        ax.grid(True, which="both", linewidth=GRID_LINEWIDTH, alpha=0.4)
+        ax.set_ylabel(f"({config.unit})")
+        ax.set_title(config.title, loc="center", fontsize=11)
+        ax.set_xlim(0, 24)
+        
+        # Plot Simulation
+        ax.plot(sim_day["hour_solar"], sim_day[code] * scale, label="Simulated", linewidth=1.5)
+        
+        # Plot Baseline
+        base_col = f"{code}_base"
+        if base_col in sim_day.columns:
+             ax.plot(sim_day["hour_solar"], sim_day[base_col] * scale, label="Baseline", color="k", linestyle="--", alpha=0.6)
+        
+        # Plot Real Data
+        if real_day is not None and not real_day.empty:
+            col_name = code
+            if code == "TD" and "Td" in real_day.columns:
+                col_name = "Td"
+            
+            x_real = None
+            if "hour_solar" in real_day.columns:
+                x_real = real_day["hour_solar"]
+            elif "DT_UTC" in real_day.columns:
+                x_real = real_day["DT_UTC"].dt.hour + real_day["DT_UTC"].dt.minute / 60.0
+            
+            if col_name in real_day.columns and x_real is not None:
+                ax.plot(x_real, real_day[col_name] * scale, label="Real", alpha=0.6, linewidth=1.5)
+        
+        ax.legend(loc="best")
+        
+    axes_list[-1].set_xlabel("Solar hour")
+    plt.tight_layout()
+    
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=150)
+        plt.close(fig)
+        print(f"Figure saved -> {save_path}")
+        return save_path
+
+    plt.show()
+    return fig
+
+
 __all__ = [
     "DISPLAY_VARIABLE_CHOICES",
     "DISPLAY_VARIABLE_DEFAULT",
@@ -711,5 +602,7 @@ __all__ = [
     "normalize_display_variables",
     "plot_intraday",
     "plot_year",
+    "plot_stochastic_year",
+    "plot_stochastic_intraday",
     "predict_model_solar",
 ]
